@@ -1,80 +1,189 @@
-import streamlit as st
-import requests
 import asyncio
-import pandas as pd
-import re
 import json
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field
 import logging
 import os
-from typing import List, Dict, Set, Optional
+import re
 import time
-from playwright.async_api import async_playwright
+from typing import List, Dict, Set, Optional
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+from pydantic import BaseModel
 import google.generativeai as genai
-from openai import OpenAI
+from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
+from urllib.parse import urljoin, urlparse
+import nltk
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.tag import pos_tag
+
+# Download NLTK data if not already present
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('averaged_perceptron_tagger')
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Data Model ---
-from startup_model import StartupData
+# Pydantic model for startup data
+class StartupData(BaseModel):
+    url: str
+    name: str
+    founders: List[str]
+    emails: List[str]
+    pages_crawled: int
+    confidence_score: float
+    extraction_method: str
 
-# --- URL FILTERING ---
-EXCLUDED_DOMAINS = {
-    'medium.com', 'forbes.com', 'techcrunch.com', 'venturebeat.com', 'wired.com',
-    'bloomberg.com', 'reuters.com', 'cnn.com', 'bbc.com', 'theguardian.com',
-    'wsj.com', 'nytimes.com', 'businessinsider.com', 'fastcompany.com', 'inc.com',
-    'entrepreneur.com', 'fortune.com', 'harvard.edu', 'mit.edu', 'youtube.com',
-    'reddit.com', 'quora.com', 'stackoverflow.com', 'wikipedia.org', 'linkedin.com',
-    'twitter.com', 'facebook.com', 'instagram.com', 'pinterest.com', 'github.com',
-    'substack.com', 'hackernoon.com', 'dev.to', 'ycombinator.com', 'crunchbase.com',
-    'pitchbook.com', 'wellfound.com', 'dealroom.co', 'tracxn.com', 'cbinsights.com',
-    'startupranking.com', 'eu-startups.com', 'builtwith.com', 'g2.com', 'capterra.com',
-    'f6s.com', 'apollo.io', 'zoominfo.com', 'amazon.com', 'google.com', 'apple.com',
-    'microsoft.com', 'meta.com', 'adobe.com', 'oracle.com', 'ibm.com', 'salesforce.com',
-    'sap.com', 'shopify.com'
-}
-
-STARTUP_POSITIVE_INDICATORS = {
-    '.ai', '.io', '.co', '.app', '.tech', '.dev', '.ml', '.xyz', '.ly',
-    'startup', 'labs', 'technologies', 'solutions', 'systems', 'platform',
-    'software', 'app', 'tool', 'service', 'api', 'saas'
-}
-
-def is_likely_startup(url: str, title: str = "", snippet: str = "") -> bool:
-    """Enhanced startup detection."""
-    if not url:
+# Enhanced validation functions
+def is_valid_name(name: str) -> bool:
+    """Enhanced name validation with better filtering."""
+    name = name.strip()
+    if not name or len(name) < 3:
         return False
     
-    try:
-        parsed = urlparse(url.lower())
-        domain = parsed.netloc.replace('www.', '')
-        
-        if any(excluded in domain for excluded in EXCLUDED_DOMAINS):
+    # Split into words
+    words = name.split()
+    if len(words) < 2 or len(words) > 4:  # Reasonable name length
+        return False
+    
+    # Check for invalid patterns
+    invalid_patterns = [
+        r'\d+',  # Contains numbers
+        r'info|team|about|contact|support|admin|sales|marketing|press',
+        r'www\.|\.com|\.org|\.net',  # Web-related
+        r'CEO|CTO|CFO|VP|Director|Manager|Lead|Head|Senior|Junior',  # Titles only
+        r'Company|Corp|Inc|LLC|Ltd|Group|Solutions|Technologies',
+        r'@|#|\$|%|\&|\*',  # Special characters
+        r'[A-Z]{3,}',  # All caps words (likely acronyms)
+    ]
+    
+    for pattern in invalid_patterns:
+        if re.search(pattern, name, re.IGNORECASE):
             return False
-        
-        startup_signals = sum(1 for indicator in STARTUP_POSITIVE_INDICATORS if indicator in domain)
-        content = f"{title} {snippet}".lower()
-        content_signals = sum(1 for keyword in ['startup', 'founder', 'ceo', 'venture', 'funding', 'seed', 'series'] if keyword in content)
-        negative_signals = sum(1 for keyword in ['blog', 'news', 'article', 'research', 'university', 'government', 'wiki', 'forum', 'job', 'career'] if keyword in content or keyword in domain)
-        
-        return (startup_signals + content_signals >= 3) and (negative_signals == 0)
+    
+    # Check if each word starts with a capital letter (proper names)
+    for word in words:
+        if not word[0].isupper() or not word[1:].islower():
+            return False
+    
+    # Use NLTK to check if words are likely proper nouns
+    try:
+        tokens = word_tokenize(name)
+        pos_tags = pos_tag(tokens)
+        proper_nouns = [word for word, pos in pos_tags if pos in ['NNP', 'NNPS']]
+        if len(proper_nouns) < len(words) * 0.5:  # At least 50% should be proper nouns
+            return False
+    except:
+        pass  # Fallback if NLTK fails
+    
+    return True
+
+def is_valid_email(email: str) -> bool:
+    """Enhanced email validation."""
+    email = email.lower().strip()
+    
+    # Basic email format check
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+        return False
+    
+    # Check for generic/invalid emails
+    invalid_patterns = [
+        r'info@|support@|contact@|sales@|team@|admin@|help@|service@|customer@',
+        r'marketing@|press@|media@|news@|careers@|jobs@|hr@|legal@',
+        r'noreply@|no-reply@|donotreply@|bounce@|mailer@|daemon@',
+        r'test@|example@|sample@|demo@|fake@|dummy@',
+        r'webmaster@|postmaster@|hostmaster@|root@|www@',
+        r'@example\.|@test\.|@localhost|@domain\.'
+    ]
+    
+    for pattern in invalid_patterns:
+        if re.search(pattern, email):
+            return False
+    
+    return True
+
+def is_startup_url(url: str, title: str = "", snippet: str = "") -> bool:
+    """Enhanced startup URL filtering."""
+    excluded_domains = [
+        'linkedin.com', 'twitter.com', 'facebook.com', 'instagram.com', 'youtube.com',
+        'wikipedia.org', 'crunchbase.com', 'substack.com', 'medium.com', 'forbes.com',
+        'techcrunch.com', 'venturebeat.com', 'bloomberg.com', 'reuters.com', 'nytimes.com',
+        'wsj.com', 'ft.com', 'cnbc.com', 'businessinsider.com', 'fortune.com',
+        'github.com', 'stackoverflow.com', 'reddit.com', 'quora.com'
+    ]
+    
+    # Extract domain
+    try:
+        domain = urlparse(url).netloc.lower()
+        domain = domain.replace('www.', '')
     except:
         return False
-
-def search_multiple_engines(keyword: str, serpapi_key: str, num_results: int = 100) -> List[Dict]:
-    """Search with multiple query variations."""
-    logger.info(f"Searching for: {keyword}")
     
+    # Check excluded domains
+    if any(excluded in domain for excluded in excluded_domains):
+        return False
+    
+    # Positive indicators
+    startup_indicators = [
+        r'\.ai$', r'\.io$', r'\.co$', r'\.tech$', r'\.app$',
+        r'startup', r'founder', r'co-founder', r'ceo', r'team',
+        r'about', r'company', r'leadership', r'innovation'
+    ]
+    
+    text = f"{url} {title} {snippet}".lower()
+    return any(re.search(pattern, text) for pattern in startup_indicators)
+
+def extract_company_name(url: str, html_content: str = "") -> str:
+    """Extract company name from URL or HTML content."""
+    try:
+        # First try to get from HTML title
+        if html_content:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            title = soup.find('title')
+            if title:
+                title_text = title.get_text().strip()
+                # Remove common suffixes
+                title_text = re.sub(r'\s*[-|–]\s*(About|Home|Company|Startup).*$', '', title_text, flags=re.IGNORECASE)
+                if title_text and len(title_text) < 100:
+                    return title_text
+        
+        # Fallback to domain name
+        domain = urlparse(url).netloc.replace('www.', '')
+        company_name = domain.split('.')[0]
+        return company_name.title()
+    except:
+        return "Unknown Company"
+
+async def enhanced_search_serpapi(keyword: str, serpapi_key: str, num_results: int = 20) -> List[Dict]:
+    """Enhanced SerpAPI search with better query strategies."""
+    cache_file = f"serpapi_cache_{keyword.replace(' ', '_')}.json"
+    
+    # Check cache first
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r') as f:
+                cached_results = json.load(f)
+                if len(cached_results) >= num_results:
+                    return cached_results[:num_results]
+        except:
+            pass
+    
+    logger.info(f"Searching SerpAPI for: {keyword}")
+    
+    # Improved query variations
     query_variations = [
-        f'"{keyword}" founder CEO -blog -news -wikipedia',
-        f'{keyword} "about us" "team" "founder" -linkedin -crunchbase',
-        f'{keyword} startup "co-founder" site:*.com OR site:*.ai OR site:*.io',
-        f'{keyword} company "leadership" "executive team" -job -career',
-        f'"{keyword}" "founded by" OR "started by" -article -post'
+        f'"{keyword}" founder CEO "about us" -linkedin -crunchbase -news',
+        f'{keyword} startup "team" "leadership" -job -career -article',
+        f'"{keyword}" "founded by" OR "co-founder" site:*.com OR site:*.ai OR site:*.io',
+        f'{keyword} company "executive team" "management" -wikipedia -blog',
+        f'"{keyword}" "our team" "meet the team" startup'
     ]
     
     all_results = []
@@ -99,7 +208,7 @@ def search_multiple_engines(keyword: str, serpapi_key: str, num_results: int = 1
                 title = result.get("title", "")
                 snippet = result.get("snippet", "")
                 
-                if url and url not in seen_urls and is_likely_startup(url, title, snippet):
+                if url and url not in seen_urls and is_startup_url(url, title, snippet):
                     all_results.append({
                         'url': url,
                         'title': title,
@@ -108,94 +217,60 @@ def search_multiple_engines(keyword: str, serpapi_key: str, num_results: int = 1
                     })
                     seen_urls.add(url)
             
-            time.sleep(1)
+            # Rate limiting
+            time.sleep(2)
+            
         except Exception as e:
             logger.error(f"Search error for query '{query}': {str(e)}")
             continue
     
-    all_results.sort(key=lambda x: (x['title'].lower().count('founder') + x['snippet'].lower().count('founder')), reverse=True)
+    # Sort by relevance
+    def relevance_score(result):
+        text = f"{result['title']} {result['snippet']}".lower()
+        score = 0
+        score += text.count('founder') * 3
+        score += text.count('ceo') * 2
+        score += text.count('team') * 1
+        score += text.count('about') * 1
+        return score
+    
+    all_results.sort(key=relevance_score, reverse=True)
+    
+    # Save to cache
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(all_results, f)
+    except Exception as e:
+        logger.error(f"Error saving cache: {str(e)}")
+    
     return all_results[:num_results]
 
-def find_all_relevant_pages(soup: BeautifulSoup, base_url: str) -> List[str]:
-    """Find relevant pages for founder info."""
-    relevant_pages = set()
-    
-    page_patterns = [
-        r'\babout\b', r'\babout.us\b', r'\bteam\b', r'\bour.team\b', r'\bleadership\b',
-        r'\bfounders?\b', r'\bcontact\b', r'\bcontact.us\b', r'\bmission\b', r'\bour.story\b',
-        r'\bexecutives?\b', r'\bwho.we.are\b', r'\bmanagement\b'
-    ]
-    
-    all_links = soup.find_all('a', href=True)
-    
-    for link in all_links:
-        href = link.get('href', '').lower()
-        text = link.get_text(strip=True).lower()
-        
-        for pattern in page_patterns:
-            if re.search(pattern, href) or re.search(pattern, text):
-                full_url = urljoin(base_url, link['href'])
-                if urlparse(full_url).netloc == urlparse(base_url).netloc:
-                    relevant_pages.add(full_url)
-                break
-    
-    base_domain = urlparse(base_url).netloc
-    base_scheme = urlparse(base_url).scheme
-    common_paths = [
-        '/about', '/about-us', '/team', '/our-team', '/company', '/leadership',
-        '/founders', '/contact', '/contact-us', '/mission', '/our-story', '/executive-team'
-    ]
-    
-    for path in common_paths:
-        relevant_pages.add(f"{base_scheme}://{base_domain}{path}")
-    
-    return list(relevant_pages)[:10]
-
-def extract_structured_data(soup: BeautifulSoup) -> Dict:
-    """Extract structured data from JSON-LD, microdata."""
-    structured_data = {"founders": [], "emails": []}
-    
-    json_scripts = soup.find_all('script', type='application/ld+json')
-    for script in json_scripts:
-        try:
-            data = json.loads(script.string)
-            if isinstance(data, dict):
-                for field in ['founder', 'founders', 'person', 'employee']:
-                    if field in data:
-                        founder_data = data[field]
-                        if isinstance(founder_data, list):
-                            for founder in founder_data:
-                                if isinstance(founder, dict) and 'name' in founder:
-                                    structured_data["founders"].append(founder['name'])
-                                elif isinstance(founder, str):
-                                    structured_data["founders"].append(founder)
-                        elif isinstance(founder_data, dict) and 'name' in founder_data:
-                            structured_data["founders"].append(founder_data['name'])
-        except:
-            continue
-    
-    founder_elements = soup.find_all(attrs={"itemtype": re.compile(r"person|founder", re.I)})
-    for element in founder_elements:
-        name_elem = element.find(attrs={"itemprop": "name"})
-        if name_elem:
-            structured_data["founders"].append(name_elem.get_text(strip=True))
-    
-    return structured_data
-
-def advanced_regex_extraction(text: str, html: str) -> Dict:
-    """Regex patterns for founder and email extraction."""
+def advanced_regex_extraction(text: str, html: str = "") -> Dict:
+    """Advanced regex extraction with context analysis."""
     founders = set()
     emails = set()
     
+    # Enhanced founder patterns with context
     founder_patterns = [
-        r'(?:founder|co-founder|ceo|chief executive officer)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\s]+(?:is|was)?\s*(?:the\s+)?(?:founder|co-founder|ceo)',
-        r'(?:founded by|started by|created by)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-        r'meet\s+(?:our\s+)?(?:founder|ceo)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s+(?:is|was)\s+(?:the\s+)?(?:founder|co-founder|ceo)\s*(?:since|in)?\s*\d{4}?'
+        # Direct mentions
+        r'(?:founded by|co-founded by|started by|created by)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+        r'(?:founder|co-founder)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\s]+(?:is|was)?\s*(?:the\s+)?(?:founder|co-founder)',
+        # CEO patterns (often founders in startups)
+        r'(?:CEO|Chief Executive Officer)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
+        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\s]+(?:is|was)?\s*(?:the\s+)?(?:CEO|Chief Executive Officer)',
+        # Team page patterns
+        r'<h[1-6][^>]*>([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)</h[1-6]>[^<]*(?:founder|ceo|chief)',
     ]
     
-    content_sources = [text, html] if html else [text]
+    # Process both text and HTML
+    content_sources = [text]
+    if html:
+        content_sources.append(html)
+        # Also extract clean text from HTML
+        soup = BeautifulSoup(html, 'html.parser')
+        clean_text = soup.get_text()
+        content_sources.append(clean_text)
     
     for content in content_sources:
         for pattern in founder_patterns:
@@ -203,13 +278,19 @@ def advanced_regex_extraction(text: str, html: str) -> Dict:
             for match in matches:
                 if isinstance(match, tuple):
                     match = match[0] if match[0] else ""
-                if match and is_valid_name(match.strip()):
-                    founders.add(match.strip())
+                
+                name = match.strip()
+                if name and is_valid_name(name):
+                    founders.add(name)
     
+    # Enhanced email extraction
     email_patterns = [
-        r'\b([a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
-        r'mailto:([a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
-        r'email[:\s]*([a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+        # Standard email pattern
+        r'\b([a-zA-Z0-9][a-zA-Z0-9._%+-]{1,50}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
+        # Emails in mailto links
+        r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        # Emails in contact sections
+        r'(?:email|contact)[:\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
     ]
     
     for content in content_sources:
@@ -221,363 +302,285 @@ def advanced_regex_extraction(text: str, html: str) -> Dict:
     
     return {"founders": list(founders), "emails": list(emails)}
 
-def is_valid_name(name: str) -> bool:
-    """Name validation."""
-    if not isinstance(name, str):
-        return False
+async def find_relevant_pages(url: str, max_pages: int = 5) -> List[str]:
+    """Find relevant pages with improved link detection."""
+    relevant_pages = [url]  # Always include main page
     
-    name = re.sub(r'\s+', ' ', name.strip())
-    if not (3 < len(name) < 60) or len(name.split()) < 2:
-        return False
+    try:
+        async with AsyncWebCrawler(config=BrowserConfig(headless=True)) as crawler:
+            result = await crawler.arun(url)
+            
+            if not result.html:
+                return relevant_pages
+            
+            soup = BeautifulSoup(result.html, 'html.parser')
+            links = soup.find_all('a', href=True)
+            
+            # Prioritized keywords for relevance
+            relevant_keywords = {
+                'about': 5, 'team': 5, 'leadership': 4, 'founder': 5,
+                'executive': 3, 'company': 3, 'management': 3,
+                'our-team': 4, 'meet-team': 4, 'who-we-are': 3,
+                'staff': 2, 'people': 2, 'board': 2
+            }
+            
+            link_scores = []
+            
+            for link in links:
+                href = link.get('href', '')
+                text = link.get_text().strip().lower()
+                
+                if not href:
+                    continue
+                
+                # Convert relative URLs to absolute
+                try:
+                    full_url = urljoin(url, href)
+                    if not full_url.startswith('http'):
+                        continue
+                    
+                    # Skip external links
+                    if urlparse(full_url).netloc != urlparse(url).netloc:
+                        continue
+                        
+                except:
+                    continue
+                
+                # Calculate relevance score
+                score = 0
+                content_to_check = f"{href} {text}".lower()
+                
+                for keyword, weight in relevant_keywords.items():
+                    if keyword in content_to_check:
+                        score += weight
+                
+                if score > 0:
+                    link_scores.append((full_url, score))
+            
+            # Sort by score and add top pages
+            link_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            for page_url, score in link_scores[:max_pages-1]:
+                if page_url not in relevant_pages:
+                    relevant_pages.append(page_url)
+            
+    except Exception as e:
+        logger.error(f"Error finding relevant pages for {url}: {str(e)}")
     
-    if not re.match(r"^[A-Za-z\s.'-]+$", name):
-        return False
-    
-    exclude_words = {
-        'ceo', 'cto', 'founder', 'co-founder', 'chief', 'officer', 'director',
-        'president', 'vice', 'company', 'inc', 'llc', 'corporation', 'team'
-    }
-    
-    name_words = set(word.lower() for word in name.split())
-    if name_words.intersection(exclude_words):
-        return False
-    
-    words = name.split()
-    return all(word[0].isupper() for word in words)
+    return relevant_pages[:max_pages]
 
-def is_valid_email(email: str) -> bool:
-    """Email validation."""
-    if not email or '@' not in email or '.' not in email:
-        return False
-    
-    email = email.lower().strip()
-    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
-        return False
-    
-    generic_prefixes = {
-        'info', 'contact', 'support', 'sales', 'admin', 'hello', 'help', 'service', 'team'
-    }
-    
-    email_prefix = email.split('@')[0]
-    return email_prefix not in generic_prefixes and ('.' in email_prefix or '_' in email_prefix or email_prefix.isalpha())
-
-def chunk_content(text: str, max_length: int = 7000) -> List[str]:
-    """Chunk content for API."""
-    return [text[i:i+max_length] for i in range(0, len(text), max_length)]
-
-def call_model_with_retry(text: str, api_key: str, model: str, url: str = "", max_retries: int = 3) -> Dict:
-    """Call selected model API with chunking and retry logic."""
+async def call_openai_enhanced(text: str, api_key: str, model_name: str, url: str = "") -> Dict:
+    """Enhanced OpenAI call with better prompting."""
+    client = AsyncOpenAI(api_key=api_key)
     results = {"founders": set(), "emails": set()}
     
-    for chunk in chunk_content(text):
-        for attempt in range(max_retries):
+    # Chunk content if too long
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] if len(text) > 4000 else [text]
+    
+    for chunk in chunks:
+        try:
+            prompt = f"""
+You are an expert at extracting founder information from company websites. 
+
+STRICT RULES:
+1. Extract ONLY full names (First Last) of actual founders, co-founders, or CEOs
+2. Names must be real people, not companies or generic terms
+3. Extract ONLY personal email addresses (name@company.com format)
+4. EXCLUDE generic emails like info@, support@, contact@, etc.
+5. Return ONLY valid JSON format
+
+EXAMPLES:
+✅ Good: "John Smith" (founder), "sarah.johnson@company.com"
+❌ Bad: "Company Team", "CEO", "info@company.com", "John" (first name only)
+
+Website: {url}
+Content to analyze:
+{chunk}
+
+Extract and return ONLY a JSON object:
+{{"founders": ["Full Name 1", "Full Name 2"], "emails": ["personal1@company.com", "personal2@company.com"]}}
+"""
+
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=400
+            )
+            
+            response_text = response.choices[0].message.content.strip()
+            
+            # Clean and parse JSON
+            response_text = re.sub(r'```json\s*', '', response_text)
+            response_text = re.sub(r'\s*```', '', response_text)
+            
             try:
-                if model == "Gemini":
-                    genai.configure(api_key=api_key)
-                    model_instance = genai.GenerativeModel('gemini-1.5-flash')
-                    prompt = f"""
-You are an expert at extracting founder information from startup websites. Extract full names of founders/co-founders/CEOs and their personal email addresses.
-
-RULES:
-1. FOUNDER NAMES: Extract full names (First Last) for roles like Founder, Co-Founder, CEO.
-2. EMAILS: Extract personal emails (e.g., john.smith@company.com), not generic ones (e.g., info@company.com).
-3. OUTPUT: Return a JSON object with "founders" and "emails" arrays.
-4. IGNORE: News articles, job listings, blog posts, or directory listings.
-
-EXAMPLES:
-Input: "Our CEO John Smith founded Acme in 2020. Contact: john.smith@acme.com"
-Output: {{"founders": ["John Smith"], "emails": ["john.smith@acme.com"]}}
-
-Input: "Founded by Sarah Lee and Tom Wilson. Contact: support@company.com"
-Output: {{"founders": ["Sarah Lee", "Tom Wilson"], "emails": []}}
-
-WEBSITE: {url}
-CONTENT:
-{chunk}
-
-Return ONLY a valid JSON object:
-"""
-                    response = model_instance.generate_content(
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.1,
-                            max_output_tokens=500,
-                            top_p=0.8
-                        )
-                    )
-                    response_text = response.text.strip()
-                    response_text = re.sub(r'```json\s*', '', response_text)
-                    response_text = re.sub(r'\s*```', '', response_text)
+                data = json.loads(response_text)
+                founders = data.get("founders", [])
+                emails = data.get("emails", [])
                 
-                elif model == "OpenAI":
-                    client = OpenAI(api_key=api_key)
-                    prompt = f"""
-You are an expert at extracting founder information from startup websites. Extract full names of founders/co-founders/CEOs and their personal email addresses.
-
-RULES:
-1. FOUNDER NAMES: Extract full names (First Last) for roles like Founder, Co-Founder, CEO.
-2. EMAILS: Extract personal emails (e.g., john.smith@company.com), not generic ones (e.g., info@company.com).
-3. OUTPUT: Return a JSON object with "founders" and "emails" arrays.
-4. IGNORE: News articles, job listings, blog posts, or directory listings.
-
-EXAMPLES:
-Input: "Our CEO John Smith founded Acme in 2020. Contact: john.smith@acme.com"
-Output: {{"founders": ["John Smith"], "emails": ["john.smith@acme.com"]}}
-
-Input: "Founded by Sarah Lee and Tom Wilson. Contact: support@company.com"
-Output: {{"founders": ["Sarah Lee", "Tom Wilson"], "emails": []}}
-
-WEBSITE: {url}
-CONTENT:
-{chunk}
-
-Return ONLY a valid JSON object:
-"""
-                    response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        max_tokens=500
-                    )
-                    response_text = response.choices[0].message.content.strip()
-                    response_text = re.sub(r'```json\s*', '', response_text)
-                    response_text = re.sub(r'\s*```', '', response_text)
+                # Validate extracted data
+                for name in founders:
+                    if isinstance(name, str) and is_valid_name(name):
+                        results["founders"].add(name.strip())
                 
-                elif model == "DeepSeek":
-                    response = requests.post(
-                        "https://api.deepseek.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": "deepseek-reasoner",
-                            "messages": [{
-                                "role": "user",
-                                "content": f"""
-You are an expert at extracting founder information from startup websites. Extract full names of founders/co-founders/CEOs and their personal email addresses.
-
-RULES:
-1. FOUNDER NAMES: Extract full names (First Last) for roles like Founder, Co-Founder, CEO.
-2. EMAILS: Extract personal emails (e.g., john.smith@company.com), not generic ones (e.g., info@company.com).
-3. OUTPUT: Return a JSON object with "founders" and "emails" arrays.
-4. IGNORE: News articles, job listings, blog posts, or directory listings.
-
-EXAMPLES:
-Input: "Our CEO John Smith founded Acme in 2020. Contact: john.smith@acme.com"
-Output: {{"founders": ["John Smith"], "emails": ["john.smith@acme.com"]}}
-
-Input: "Founded by Sarah Lee and Tom Wilson. Contact: support@company.com"
-Output: {{"founders": ["Sarah Lee", "Tom Wilson"], "emails": []}}
-
-WEBSITE: {url}
-CONTENT:
-{chunk}
-
-Return ONLY a valid JSON object:
-"""
-                            }],
-                            "temperature": 0.1,
-                            "max_tokens": 500
-                        }
-                    )
-                    response.raise_for_status()
-                    response_text = response.json()['choices'][0]['message']['content'].strip()
-                    response_text = re.sub(r'```json\s*', '', response_text)
-                    response_text = re.sub(r'\s*```', '', response_text)
-                
-                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group())
-                    founders = data.get("founders", [])
-                    emails = data.get("emails", [])
-                    results["founders"].update([name for name in founders if is_valid_name(str(name))])
-                    results["emails"].update([email for email in emails if is_valid_email(str(email))])
-                    break
-                else:
-                    logger.warning(f"No JSON found in response for {model} (attempt {attempt + 1})")
-                
-                time.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"{model} API error (attempt {attempt + 1}): {str(e)}")
-                if attempt == max_retries - 1:
-                    break
-                time.sleep(2 ** attempt)
+                for email in emails:
+                    if isinstance(email, str) and is_valid_email(email):
+                        results["emails"].add(email.lower().strip())
+                        
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON from OpenAI: {response_text[:100]}")
+            
+        except Exception as e:
+            logger.error(f"OpenAI API error: {str(e)}")
+            break
     
     return {"founders": list(results["founders"]), "emails": list(results["emails"])}
 
-async def crawl_with_playwright(url: str) -> tuple[str, bool]:
-    """Crawl page using Playwright."""
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            content = await page.content()
-            await browser.close()
-            return content, True
-    except Exception as e:
-        logger.error(f"Playwright error for {url}: {str(e)}")
-        return "", False
-
-async def extract_from_multiple_pages(url: str, api_key: str, model: str, max_pages: int = 6) -> StartupData:
-    """Extract founder info with selected model or regex/structured data."""
-    logger.info(f"Starting extraction for: {url}")
-    
-    all_founders = set()
-    all_emails = set()
+async def extract_startup_data(url: str, api_key: str, model: str, max_pages: int = 3) -> StartupData:
+    """Enhanced startup data extraction."""
+    founders = set()
+    emails = set()
     pages_crawled = 0
-    total_content = []
+    extraction_methods = []
     
-    # Crawl main page
-    html, success = await crawl_with_playwright(url)
-    if not success:
-        logger.error(f"Failed to crawl main page: {url}")
-        return StartupData(url=url, name="Failed to load", founders=[], emails=[], pages_crawled=0, confidence_score=0.0)
-    
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # Extract company name
-    company_name = "Unknown"
-    if soup.title:
-        title_text = soup.title.text.strip()
-        company_name = re.split(r'\s*[-|–]\s*', title_text)[0].strip()
-        company_name = re.sub(r'\s*\|\s*.*$', '', company_name).strip()
-    
-    logger.info(f"Company: {company_name}")
-    
-    # Process main page
-    main_text = BeautifulSoup(html, 'html.parser').get_text(separator=' ', strip=True)
-    total_content.append(main_text)
-    pages_crawled += 1
-    
-    structured_data = extract_structured_data(soup)
-    regex_data = advanced_regex_extraction(main_text, html)
-    
-    all_founders.update(structured_data.get("founders", []))
-    all_founders.update(regex_data.get("founders", []))
-    all_emails.update(structured_data.get("emails", []))
-    all_emails.update(regex_data.get("emails", []))
-    
-    # Crawl related pages
-    relevant_pages = find_all_relevant_pages(soup, url)
-    logger.info(f"Found {len(relevant_pages)} potentially relevant pages")
-    
-    for page_url in relevant_pages[:max_pages-1]:
-        try:
-            if page_url != url:
-                await asyncio.sleep(1)
-                page_html, page_success = await crawl_with_playwright(page_url)
-                if page_success and page_html:
-                    page_soup = BeautifulSoup(page_html, 'html.parser')
-                    page_text = page_soup.get_text(separator=' ', strip=True)
+    try:
+        # Find relevant pages
+        relevant_pages = await find_relevant_pages(url, max_pages)
+        
+        async with AsyncWebCrawler(config=BrowserConfig(headless=True)) as crawler:
+            for page_url in relevant_pages:
+                try:
+                    result = await crawler.arun(
+                        url=page_url,
+                        config=CrawlerRunConfig(cache_mode="BYPASS")
+                    )
                     
-                    total_content.append(page_text)
+                    if not result.markdown and not result.html:
+                        continue
+                    
                     pages_crawled += 1
                     
-                    page_structured = extract_structured_data(page_soup)
-                    page_regex = advanced_regex_extraction(page_text, page_html)
+                    # Try AI extraction first
+                    if model.startswith("OpenAI") and api_key:
+                        openai_model = "gpt-4o" if "gpt-4o" in model else "gpt-4o-mini"
+                        ai_result = await call_openai_enhanced(result.markdown, api_key, openai_model, page_url)
+                        
+                        if ai_result["founders"] or ai_result["emails"]:
+                            founders.update(ai_result["founders"])
+                            emails.update(ai_result["emails"])
+                            extraction_methods.append("AI")
                     
-                    all_founders.update(page_structured.get("founders", []))
-                    all_founders.update(page_regex.get("founders", []))
-                    all_emails.update(page_structured.get("emails", []))
-                    all_emails.update(page_regex.get("emails", []))
+                    # Always try regex as backup/supplement
+                    regex_result = advanced_regex_extraction(result.markdown, result.html)
+                    if regex_result["founders"] or regex_result["emails"]:
+                        founders.update(regex_result["founders"])
+                        emails.update(regex_result["emails"])
+                        if "Regex" not in extraction_methods:
+                            extraction_methods.append("Regex")
                     
-                    logger.info(f"Successfully crawled: {page_url}")
-                else:
-                    logger.warning(f"Failed to crawl: {page_url}")
-        except Exception as e:
-            logger.error(f"Error crawling {page_url}: {str(e)}")
-            continue
-    
-    # Combine content for AI analysis
-    combined_content = "\n\n".join(total_content)
-    
-    # Model extraction (if API key is provided and valid)
-    if api_key and len(combined_content) > 100:
-        try:
-            ai_result = call_model_with_retry(combined_content, api_key, model, url)
-            all_founders.update(ai_result.get("founders", []))
-            all_emails.update(ai_result.get("emails", []))
-            logger.info(f"{model} extraction successful for {url}")
-        except Exception as e:
-            logger.warning(f"{model} extraction failed for {url}: {str(e)}. Falling back to regex/structured data.")
-    
-    # Final validation
-    final_founders = [re.sub(r'\s+', ' ', str(founder).strip()) for founder in all_founders if is_valid_name(str(founder))]
-    final_emails = [str(email).lower().strip() for email in all_emails if is_valid_email(str(email))]
-    
-    # Confidence score
-    confidence = min(1.0, (len(final_founders) * 0.5 + len(final_emails) * 0.4 + pages_crawled * 0.05))
-    
-    logger.info(f"Extraction complete for {company_name}: {len(final_founders)} founders, {len(final_emails)} emails, {pages_crawled} pages")
-    
-    return StartupData(
-        url=url,
-        name=company_name,
-        founders=final_founders,
-        emails=final_emails,
-        pages_crawled=pages_crawled,
-        confidence_score=confidence
-    )
+                except Exception as e:
+                    logger.error(f"Error processing {page_url}: {str(e)}")
+                    continue
+        
+        # Extract company name
+        company_name = extract_company_name(url)
+        
+        # Calculate confidence score
+        confidence_score = min(1.0, (len(founders) * 0.4 + len(emails) * 0.6) / max_pages)
+        
+        return StartupData(
+            url=url,
+            name=company_name,
+            founders=list(founders),
+            emails=list(emails),
+            pages_crawled=pages_crawled,
+            confidence_score=confidence_score,
+            extraction_method=", ".join(extraction_methods) or "None"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error extracting data from {url}: {str(e)}")
+        return StartupData(
+            url=url,
+            name="Error",
+            founders=[],
+            emails=[],
+            pages_crawled=pages_crawled,
+            confidence_score=0.0,
+            extraction_method="Error"
+        )
 
-async def run_enhanced_crawler(keyword: str, serpapi_key: str, api_key: str, model: str, max_results: int = 20, max_pages_per_site: int = 6) -> pd.DataFrame:
-    """Crawler workflow with selected model and fallback to regex."""
-    logger.info("Starting crawler workflow")
+async def run_enhanced_crawler(keyword: str, serpapi_key: str, api_key: str, model: str, max_results: int = 10) -> pd.DataFrame:
+    """Main crawler function with enhanced processing."""
+    logger.info("Starting enhanced crawler workflow")
     
-    search_results = search_multiple_engines(keyword, serpapi_key, max_results * 3)
+    # Search for URLs
+    search_results = await enhanced_search_serpapi(keyword, serpapi_key, max_results * 2)
     
     if not search_results:
         st.warning("No suitable startup URLs found.")
         return pd.DataFrame()
     
-    st.write(f"🎯 Found {len(search_results)} high-quality startup URLs")
-    with st.expander("View Search Results"):
+    st.write(f"🎯 Found {len(search_results)} potential startup URLs")
+    
+    # Show preview
+    with st.expander("🔍 View Search Results"):
         for i, result in enumerate(search_results[:max_results], 1):
-            st.write(f"{i}. **{result['title']}**")
-            st.write(f"   URL: {result['url']}")
-            st.write(f"   Snippet: {result['snippet'][:100]}...")
+            st.write(f"**{i}. {result['title']}**")
+            st.write(f"URL: {result['url']}")
+            st.write(f"Snippet: {result['snippet'][:150]}...")
             st.write("---")
     
+    # Process URLs
     progress_bar = st.progress(0)
     status_text = st.empty()
     results_container = st.container()
     
+    urls_to_process = [result['url'] for result in search_results[:max_results]]
     extraction_results = []
     successful_extractions = 0
-    batch_size = 3
-    urls_to_process = [result['url'] for result in search_results[:max_results]]
     
-    for i in range(0, len(urls_to_process), batch_size):
-        batch_urls = urls_to_process[i:i + batch_size]
-        status_text.text(f"Processing batch {i//batch_size + 1}/{len(urls_to_process)//batch_size + 1}")
+    for i, url in enumerate(urls_to_process):
+        status_text.text(f"Processing {i+1}/{len(urls_to_process)}: {url}")
         
-        tasks = [extract_from_multiple_pages(url, api_key, model, max_pages_per_site) for url in batch_urls]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for j, result in enumerate(batch_results):
-            current_idx = i + j
-            if isinstance(result, Exception):
-                logger.error(f"Exception processing URL {batch_urls[j]}: {str(result)}")
-                result = StartupData(url=batch_urls[j], name="Error", founders=[], emails=[], pages_crawled=0, confidence_score=0.0)
-            
+        try:
+            result = await extract_startup_data(url, api_key, model, max_pages=3)
             extraction_results.append(result.model_dump())
             
             if result.founders or result.emails:
                 successful_extractions += 1
                 with results_container:
-                    st.success(f"✅ **{result.name}** - Found {len(result.founders)} founders, {len(result.emails)} emails ({result.pages_crawled} pages)")
+                    st.success(f"✅ **{result.name}** - Found {len(result.founders)} founders, {len(result.emails)} emails")
+                    if result.founders:
+                        st.write(f"Founders: {', '.join(result.founders)}")
+                    if result.emails:
+                        st.write(f"Emails: {', '.join(result.emails)}")
             else:
                 with results_container:
-                    st.info(f"ℹ️ **{result.name}** - No founder data found ({result.pages_crawled} pages)")
+                    st.info(f"ℹ️ **{result.name}** - No founder data found")
             
-            progress_bar.progress((current_idx + 1) / len(urls_to_process))
+        except Exception as e:
+            logger.error(f"Error processing {url}: {str(e)}")
+            extraction_results.append({
+                "url": url,
+                "name": "Error",
+                "founders": [],
+                "emails": [],
+                "pages_crawled": 0,
+                "confidence_score": 0.0,
+                "extraction_method": "Error"
+            })
         
-        if i + batch_size < len(urls_to_process):
+        progress_bar.progress((i + 1) / len(urls_to_process))
+        
+        # Small delay to avoid overwhelming servers
+        if i < len(urls_to_process) - 1:
             await asyncio.sleep(2)
     
     status_text.text(f"✅ Completed! Found data for {successful_extractions}/{len(extraction_results)} companies")
     
+    # Create DataFrame
     df = pd.DataFrame({
         "Company Name": [r["name"] for r in extraction_results],
         "Website URL": [r["url"] for r in extraction_results],
@@ -585,9 +588,11 @@ async def run_enhanced_crawler(keyword: str, serpapi_key: str, api_key: str, mod
         "Founder Emails": [", ".join(r["emails"]) for r in extraction_results],
         "Pages Crawled": [r["pages_crawled"] for r in extraction_results],
         "Confidence Score": [f"{r['confidence_score']:.2f}" for r in extraction_results],
+        "Extraction Method": [r["extraction_method"] for r in extraction_results],
         "Data Found": ["✅" if (r["founders"] or r["emails"]) else "❌" for r in extraction_results]
     })
     
+    # Save results
     try:
         timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         excel_filename = f"startup_founders_enhanced_{timestamp}.xlsx"
@@ -606,132 +611,98 @@ async def run_enhanced_crawler(keyword: str, serpapi_key: str, api_key: str, mod
     return df
 
 def main():
-    st.set_page_config(page_title="Startup Founder Extractor", page_icon="🚀", layout="wide")
-    st.title("🚀 Startup Founder Extractor")
-    st.markdown("**Crawler for startup founder data extraction with multiple model support (falls back to regex if API unavailable)**")
+    """Streamlit app main function."""
+    st.set_page_config(page_title="Founder Extractor Agent", page_icon="", layout="wide")
     
-    if 'extraction_stats' not in st.session_state:
-        st.session_state.extraction_stats = {
-            'total_processed': 0,
-            'successful_extractions': 0,
-            'total_pages_crawled': 0
-        }
+    st.title("🚀 Enhanced Startup Founder Extractor")
+    st.markdown("Extract founder names and emails from startup websites with improved AI and regex methods.")
     
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        serpapi_key = st.text_input("🔍 SerpAPI Key", type="password")
-        
-        model = st.selectbox("🤖 Select Model", ["Gemini", "OpenAI", "DeepSeek"])
-        api_key = st.text_input(f"🤖 {model} API Key (optional)", type="password")
-        
-        keyword = st.text_input("🎯 Search Keywords", value="AI fintech startups 2024")
-        
+    with st.form("crawler_form"):
         col1, col2 = st.columns(2)
+        
         with col1:
-            max_results = st.slider("📊 Companies", 5, 20, 10)
-        with col2:
-            max_pages = st.slider("📄 Pages/Site", 3, 10, 5)
-        
-        st.subheader("📊 Session Stats")
-        stats = st.session_state.extraction_stats
-        st.metric("Companies Processed", stats['total_processed'])
-        st.metric("Successful Extractions", stats['successful_extractions'])
-        st.metric("Pages Crawled", stats['total_pages_crawled'])
-        
-        if stats['total_processed'] > 0:
-            success_rate = (stats['successful_extractions'] / stats['total_processed']) * 100
-            st.metric("Success Rate", f"{success_rate:.1f}%")
-    
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        if st.button("🚀 Start Extraction", type="primary", use_container_width=True):
-            if not serpapi_key or not keyword:
-                st.error("❌ Please provide SerpAPI key and keywords")
-                return
+            keyword = st.text_input(
+                "Search Keyword", 
+                value="AI fintech startups 2025",
+                help="Try specific terms like 'AI fintech startups 2025' or 'B2B SaaS startups founders'"
+            )
+            serpapi_key = st.text_input("SerpAPI Key", type="password")
             
-            with st.spinner("🔍 Searching and extracting..."):
-                start_time = time.time()
-                df = asyncio.run(run_enhanced_crawler(keyword, serpapi_key, api_key, model, max_results, max_pages))
-                end_time = time.time()
+        with col2:
+            api_key = st.text_input("OpenAI API Key", type="password")
+            model = st.selectbox("Model", [
+                "OpenAI GPT-4o",
+                "OpenAI GPT-4o-mini"
+            ])
+        
+        max_results = st.slider("Maximum Results to Process", 5, 30, 10)
+        
+        submit_button = st.form_submit_button("🚀 Start Extraction", use_container_width=True)
+    
+    if submit_button:
+        if not serpapi_key:
+            st.error("Please provide a SerpAPI key.")
+            return
+        
+        if not api_key and model.startswith("OpenAI"):
+            st.warning("OpenAI API key not provided. Will use regex extraction only.")
+        
+        st.markdown("---")
+        st.write("###  Processing Results")
+    
+        try:
+            df = asyncio.run(run_enhanced_crawler(
+                keyword=keyword,
+                serpapi_key=serpapi_key,
+                api_key=api_key,
+                model=model,
+                max_results=max_results
+            ))
             
             if not df.empty:
-                st.success(f"🎉 Extraction completed in {end_time - start_time:.1f} seconds!")
+                st.markdown("---")
+                st.write("###  Final Results")
                 
-                st.session_state.extraction_stats['total_processed'] += len(df)
-                st.session_state.extraction_stats['successful_extractions'] += len(df[df['Data Found'] == '✅'])
-                st.session_state.extraction_stats['total_pages_crawled'] += df['Pages Crawled'].sum()
-                
-                st.subheader("📊 Extraction Summary")
+                # Summary metrics
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Companies", len(df))
                 with col2:
-                    successful = len(df[df['Data Found'] == '✅'])
-                    st.metric("With Data", successful)
+                    successful = len(df[df["Data Found"] == "✅"])
+                    st.metric("Successful Extractions", successful)
                 with col3:
-                    total_founders = sum(len(founders.split(', ')) if founders else 0 for founders in df['Founders'])
-                    st.metric("Total Founders", total_founders)
+                    total_founders = sum(len(founders.split(", ")) if founders else 0 for founders in df["Founders"])
+                    st.metric("Total Founders Found", total_founders)
                 with col4:
-                    total_emails = sum(len(emails.split(', ')) if emails else 0 for emails in df['Founder Emails'])
-                    st.metric("Total Emails", total_emails)
+                    total_emails = sum(len(emails.split(", ")) if emails else 0 for emails in df["Founder Emails"])
+                    st.metric("Total Emails Found", total_emails)
                 
-                st.subheader("📋 Detailed Results")
-                show_filter = st.selectbox("Show results:", ["All companies", "Only successful extractions", "Only failed extractions"])
+                # Display results table
+                st.dataframe(df, use_container_width=True)
                 
-                if show_filter == "Only successful extractions":
-                    display_df = df[df['Data Found'] == '✅']
-                elif show_filter == "Only failed extractions":
-                    display_df = df[df['Data Found'] == '❌']
-                else:
-                    display_df = df
-                
-                display_df = display_df.sort_values('Confidence Score', ascending=False)
-                st.dataframe(display_df, use_container_width=True, height=400)
-                
-                st.subheader("📥 Download Results")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if 'excel_file' in st.session_state and os.path.exists(st.session_state['excel_file']):
-                        with open(st.session_state['excel_file'], "rb") as file:
+                # Download buttons
+                if 'excel_file' in st.session_state and 'csv_file' in st.session_state:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        with open(st.session_state['excel_file'], 'rb') as f:
                             st.download_button(
-                                label="📊 Download Excel",
-                                data=file,
+                                " Download Excel",
+                                f,
                                 file_name=st.session_state['excel_file'],
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
-                
-                with col2:
-                    if 'csv_file' in st.session_state and os.path.exists(st.session_state['csv_file']):
-                        with open(st.session_state['csv_file'], "rb") as file:
+                    with col2:
+                        with open(st.session_state['csv_file'], 'rb') as f:
                             st.download_button(
-                                label="📄 Download CSV",
-                                data=file,
+                                "Download CSV",
+                                f,
                                 file_name=st.session_state['csv_file'],
-                                mime="text/csv",
-                                use_container_width=True
+                                mime="text/csv"
                             )
-                
-                st.subheader("🔍 Company Details")
-                successful_companies = df[df['Data Found'] == '✅'].sort_values('Confidence Score', ascending=False)
-                
-                for _, row in successful_companies.iterrows():
-                    with st.expander(f"✅ **{row['Company Name']}** (Confidence: {row['Confidence Score']})"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"**Website:** {row['Website URL']}")
-                            st.write(f"**Pages Crawled:** {row['Pages Crawled']}")
-                        with col2:
-                            if row['Founders']:
-                                st.write(f"**Founders:** {row['Founders']}")
-                            if row['Founder Emails']:
-                                st.write(f"**Emails:** {row['Founder Emails']}")
-    
-    with col2:
-        st.subheader("💡 Tips")
-        st.info("Use specific keywords like 'AI fintech startups 2024' for best results. Select a model and provide its API key for enhanced extraction; regex fallback ensures functionality if API is unavailable.")
+            
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
+            logger.error(f"Main execution error: {str(e)}")
 
 if __name__ == "__main__":
     main()
