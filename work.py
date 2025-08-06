@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import subprocess
 from typing import List, Dict, Set, Optional
 import pandas as pd
 import requests
@@ -17,6 +18,15 @@ from urllib.parse import urljoin, urlparse
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.tag import pos_tag
+
+# Install Playwright browsers
+def install_playwright_browsers():
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        logging.error(f"Failed to install Playwright browsers: {str(e)}")
+
+install_playwright_browsers()
 
 try:
     nltk.data.find('tokenizers/punkt')
@@ -229,7 +239,6 @@ def advanced_regex_extraction(text: str, html: str = "") -> Dict:
     emails = set()
     
     founder_patterns = [
-        # Direct mentions
         r'(?:founded by|co-founded by|started by|created by)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
         r'(?:founder|co-founder)[:\s,-]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)',
         r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\s]+(?:is|was)?\s*(?:the\s+)?(?:founder|co-founder)',
@@ -257,7 +266,6 @@ def advanced_regex_extraction(text: str, html: str = "") -> Dict:
                     founders.add(name)
     
     email_patterns = [
-        # Standard email pattern
         r'\b([a-zA-Z0-9][a-zA-Z0-9._%+-]{1,50}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b',
         r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
         r'(?:email|contact)[:\s]*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
@@ -603,7 +611,7 @@ def main():
             st.warning("OpenAI API key not provided. Will use regex extraction only.")
         
         st.markdown("---")
-        st.write("###  Processing Results")
+        st.write("### Processing Results")
     
         try:
             df = asyncio.run(run_enhanced_crawler(
@@ -616,9 +624,8 @@ def main():
             
             if not df.empty:
                 st.markdown("---")
-                st.write("###  Final Results")
+                st.write("### Final Results")
                 
-               
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Companies", len(df))
@@ -632,16 +639,14 @@ def main():
                     total_emails = sum(len(emails.split(", ")) if emails else 0 for emails in df["Founder Emails"])
                     st.metric("Total Emails Found", total_emails)
                 
-               
                 st.dataframe(df, use_container_width=True)
                 
-            
                 if 'excel_file' in st.session_state and 'csv_file' in st.session_state:
                     col1, col2 = st.columns(2)
                     with col1:
                         with open(st.session_state['excel_file'], 'rb') as f:
                             st.download_button(
-                                " Download Excel",
+                                "Download Excel",
                                 f,
                                 file_name=st.session_state['excel_file'],
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
