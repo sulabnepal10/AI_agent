@@ -1,0 +1,11 @@
+Company Name,Website URL,Founders,Founder Emails,Pages Crawled,Confidence Score,Extraction Method,Data Found
+Tldr,https://tldr.tech/tech/2025-03-07,,,1,0.00,None,❌
+Startupsavant,https://startupsavant.com/startups-to-watch/fintech,,,3,0.00,None,❌
+Medial,https://medial.app/news/easemytrip-cofounder-launches-ai-venture-studio-to-nurture-startups-across-multiple-sectors-including-logistics-fintech-the-economic-times-d6e39f82c43de,,"simulationexchange@gmail.com, sanjay@blume.vc, sayan@ogcapital.one",1,0.15,Regex,✅
+Bundle,https://bundle.app/qD3S4EIS,,,2,0.00,None,❌
+Fintechfutures,https://www.fintechfutures.com/ai-in-fintech/stax-payments-founders-launch-business-credit-decisioning-platform-worth-ai,,informa_logo_white@2x.png,2,0.10,Regex,✅
+Adamfard,https://adamfard.com/blog/ai-startups,,,3,0.00,None,❌
+Epirus,https://www.epirus.vc/blog/how-to-choose-a-startup-to-invest-in-2025-a-guide-for-small-capital-investors,,,1,0.00,None,❌
+Medial,https://medial.app/news/wonder-dynamics-co-founder-nikola-todorovic-joins-disrupt-2025-or-techcrunch-aa69503a57f3b,,"simulationexchange@gmail.com, sanjay@blume.vc, sayan@ogcapital.one",1,0.15,Regex,✅
+Femaleswitch,https://www.femaleswitch.com/playbook/tpost/dgtsv20ei1-top-10-startup-blogs-in-2025,,,3,0.00,None,❌
+Kruzeconsulting,https://kruzeconsulting.com/blog/how-startups-using-ai/,,"jesse.shefferman@kruzeconsulting.com, bill.hollowsky@company.com, beth.bassler@company.com, claudine.vantomme@company.com, vanessa@kruzeconsulting.com, vanessa.kruze@company.com, jesse.shefferman@company.com, vanessa.kruze@kruzeconsulting.com, morgan.avery@company.com",3,1.00,"AI, Regex, AI, AI",✅
