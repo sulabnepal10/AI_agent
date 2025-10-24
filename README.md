@@ -1,5 +1,8 @@
 # Startup Founder Extractor
 
+## 🚀 Live Demo  
+[Visit the App](https://founders-extractor-automation.streamlit.app/)
+
 ## Overview
 This project uses Crawl4AI to automate web crawling and data extraction, retrieving founder names and email addresses from startup websites based on a keyword search. It integrates SerpAPI for Google search results, BeautifulSoup for HTML parsing, NLTK for natural language processing, and OpenAI for enhanced data extraction.
 
